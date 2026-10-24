@@ -892,7 +892,7 @@ export async function readAllEntries(
   c: RegisterCrypto,
   cp: { size: number; root: Uint8Array },
   files: RegisterFiles,
-  visit?: (index: number, leaf: Leaf) => void | Promise<void>,
+  visit?: (index: number, leaf: Leaf, hash: Uint8Array) => void | Promise<void>,
   onProgress?: (done: number, size: number) => void,
 ): Promise<void> {
   const { size } = cp;
@@ -914,7 +914,7 @@ export async function readAllEntries(
     }));
     for (let j = 0; j < rows.length; j++) {
       frontier = await frontierAppend(c, frontier, start + j, rows[j].hash);
-      await visit?.(start + j, rows[j].leaf);
+      await visit?.(start + j, rows[j].leaf, rows[j].hash);
     }
     onProgress?.(start + width, size);
   }
@@ -972,7 +972,7 @@ export interface WatchResult {
  * neuesten Stands; falls ein voriger Stand bekannt ist, dass der neue ihn
  * fortsetzt (Konsistenzbeweis aus den Kacheln, RFC 9162 2.1.4) und der vorige
  * selbst gueltig unterschrieben war; mit `full` zusaetzlich jeden Eintrag
- * (readAllEntries). Wirft bei jedem Bruch mit lesbarer Meldung.
+ * (readAllEntries) und jede Kachel dieses Stands. Wirft bei jedem Bruch mit lesbarer Meldung.
  */
 export async function watchRegister(
   c: RegisterCrypto,
@@ -1004,6 +1004,17 @@ export async function watchRegister(
   }
 
   const kinds: Record<EntryKind, number> = { issue: 0, transfer: 0, redeem: 0, revoke: 0, reinstate: 0 };
-  if (opts.full) await readAllEntries(c, checkpoint, files, (_i, leaf) => { kinds[leaf.kind]++; }, opts.onProgress);
+  if (opts.full) {
+    const hashes: Uint8Array[] = [];
+    await readAllEntries(c, checkpoint, files, (_i, leaf, hash) => { kinds[leaf.kind]++; hashes.push(hash); }, opts.onProgress);
+    // Jede Kachel dieses Stands aus den Eintraegen neu bauen und mit der
+    // veroeffentlichten vergleichen. Die Wurzel oben liest nur die Kacheln, die
+    // sie braucht; eine gefaelschte untere Kachel faellt sonst erst dem auf,
+    // dessen Beweisweg darueber laeuft (Manipulationstest, Stufe 5).
+    const { tiles } = await buildTiles(c, 0, size, hashes, new Map());
+    for (const t of tiles) {
+      if (!bytesEqual(await files(tilePath(t.ref)), t.data)) throw new Error(`Die Kachel ${tilePath(t.ref)} passt nicht zu den Einträgen.`);
+    }
+  }
   return { checkpoint, note, added: size - previous, kinds };
 }
