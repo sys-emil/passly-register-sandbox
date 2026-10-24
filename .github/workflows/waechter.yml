@@ -1,0 +1,81 @@
+name: Wächter
+
+# Stündlich: neuesten Stand des Passly Registers (Sandbox) prüfen, mit zwei
+# unabhängigen Implementierungen nachrechnen, die Fortsetzung des zuletzt hier
+# gespeicherten Stands beweisen und den neuen Stand committen. Einmal am Tag
+# kommt ein RFC-3161-Zeitstempel dazu. Schlägt ein Schritt fehl, bleibt der
+# alte Stand stehen und GitHub schickt eine Mail.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: waechter
+  cancel-in-progress: false
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gegenprobe/go.mod
+          cache-dependency-path: gegenprobe/go.sum
+
+      # Exit 1 = Bruch (sofort rot), Exit 2 = nicht erreichbar (bis zu drei Versuche).
+      - name: Prüfen (Passly-Implementierung, jeder Eintrag)
+        run: |
+          for i in 1 2 3; do
+            node pruefen.mjs stand --base "$(cat basis)" --vkey vkey --vorher checkpoint --voll --schreibe checkpoint.neu && exit 0
+            code=$?; [ "$code" = 2 ] || exit "$code"; sleep 30
+          done
+          exit 2
+
+      - name: Gegenprobe (golang.org/x/mod/sumdb/tlog)
+        working-directory: gegenprobe
+        run: |
+          for i in 1 2 3; do
+            go run . -base "$(cat ../basis)" -vkey ../vkey -vorher ../checkpoint && exit 0
+            code=$?; [ "$code" = 2 ] || exit "$code"; sleep 30
+          done
+          exit 2
+
+      - name: Neuen Stand speichern
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! cmp -s checkpoint checkpoint.neu; then
+            mv checkpoint.neu checkpoint
+            git add checkpoint
+            git commit -q -m "Stand $(sed -n 2p checkpoint)"
+          fi
+          rm -f checkpoint.neu
+
+      - name: Zeitstempel (einmal am Tag)
+        run: |
+          tag=$(date -u +%F)
+          [ -f "zeitstempel/$tag.tsr" ] && exit 0
+          cp checkpoint "zeitstempel/$tag.checkpoint"
+          openssl ts -query -data "zeitstempel/$tag.checkpoint" -sha256 -cert -out /tmp/anfrage.tsq
+          for i in 1 2 3; do
+            curl -fsS -H "Content-Type: application/timestamp-query" --data-binary @/tmp/anfrage.tsq https://freetsa.org/tsr -o "zeitstempel/$tag.tsr" && break
+            sleep 20
+          done
+          openssl ts -verify -in "zeitstempel/$tag.tsr" -data "zeitstempel/$tag.checkpoint" \
+            -CAfile zeitstempel/freetsa-cacert.pem -untrusted zeitstempel/freetsa-tsa.crt
+          git add "zeitstempel/$tag.checkpoint" "zeitstempel/$tag.tsr"
+          git commit -q -m "Zeitstempel $tag (Stand $(sed -n 2p checkpoint))"
+
+      - name: Hochladen
+        run: git push -q
