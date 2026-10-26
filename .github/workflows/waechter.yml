@@ -62,6 +62,22 @@ jobs:
           fi
           rm -f checkpoint.neu
 
+      # Erst nach bestandenen Prüfungen: der Zeuge unterschreibt nur, was den
+      # zuletzt gesehenen Stand fortsetzt. Neu bei jedem neuen Stand, sonst
+      # spätestens nach 20 Stunden, damit Browser sehen, dass er noch wacht.
+      - name: Als Zeuge gegenzeichnen
+        env:
+          ZEUGE_SCHLUESSEL: ${{ secrets.ZEUGE_SCHLUESSEL }}
+        run: |
+          [ -n "$ZEUGE_SCHLUESSEL" ] || { echo "kein ZEUGE_SCHLUESSEL gesetzt, übersprungen"; exit 0; }
+          zuletzt=$(git log -1 --format=%ct -- bezeugt)
+          alter=$(( $(date +%s) - ${zuletzt:-0} ))
+          if [ ! -f bezeugt ] || [ "$(sed -n 2p bezeugt)" != "$(sed -n 2p checkpoint)" ] || [ "$alter" -gt 72000 ]; then
+            node pruefen.mjs bezeugen --stand checkpoint --name github.com/sys-emil/passly-register-sandbox --schreibe bezeugt
+            git add bezeugt
+            git commit -q -m "Bezeugt: Stand $(sed -n 2p checkpoint)"
+          fi
+
       - name: Zeitstempel (einmal am Tag)
         run: |
           tag=$(date -u +%F)

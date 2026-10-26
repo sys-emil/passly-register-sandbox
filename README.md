@@ -24,6 +24,11 @@ Die GitHub Action [`waechter.yml`](.github/workflows/waechter.yml):
    der Go-Prüfsummendatenbank),
 5. committet den neuen Stand, einmal am Tag mit einem **RFC-3161-Zeitstempel**
    ([`zeitstempel/`](zeitstempel)).
+6. zeichnet den geprüften Stand als **Zeuge** gegen ([`bezeugt`](bezeugt),
+   C2SP `tlog-cosignature/v1`, öffentlicher Schlüssel in [`zeuge.vkey`](zeuge.vkey)).
+   Passly hängt diese Bestätigung an jede Prüfung im Browser: Setzt der Stand,
+   den Passly gerade zeigt, den bezeugten nicht fort, schlägt die Prüfung fehl.
+   Der Zeuge unterschreibt nur, was er selbst nachgerechnet hat.
 
 Schlägt eine Prüfung fehl, bleibt der alte Stand hier stehen und der Lauf wird
 rot. Die Git-Historie dieses Repos ist damit ein Protokoll aller Stände, das

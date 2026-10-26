@@ -695,6 +695,103 @@ export async function verifySignedNote(note: string, key: VerifierKey, verify: E
   return null;
 }
 
+// ---------------------------------------------------------------- Zeugen (C2SP tlog-cosignature)
+
+/*
+ * Ein Zeuge ist ein Dritter mit eigenem Schluessel. Er unterschreibt einen
+ * Stand nur, wenn er den zuletzt von ihm gesehenen fortsetzt. Seine Zeile
+ * haengt an derselben Notiz wie die Unterschrift von Passly; wer nur Passly
+ * prueft (auch Go-note), ueberspringt sie. Passly kann sie nicht faelschen,
+ * nur weglassen. Damit hat der Browser ein Gedaechtnis, das nicht Passly gehoert.
+ */
+
+const ALG_COSIGNATURE_V1 = 0x04;
+
+/** Erste 4 Byte von SHA-256(name || "\n" || 0x04 || publicKey). */
+export async function witnessKeyHash(c: RegisterCrypto, name: string, publicKey: Uint8Array): Promise<Uint8Array> {
+  checkKeyName(name);
+  return (await c.sha256(concatBytes(enc.encode(`${name}\n`), new Uint8Array([ALG_COSIGNATURE_V1]), publicKey))).slice(0, 4);
+}
+
+/** Zeugen-Schluessel: name+hash+base64(0x04||key). */
+export async function formatWitnessKey(c: RegisterCrypto, name: string, publicKey: Uint8Array): Promise<string> {
+  return `${name}+${toHex(await witnessKeyHash(c, name, publicKey))}+${toBase64(concatBytes(new Uint8Array([ALG_COSIGNATURE_V1]), publicKey))}`;
+}
+
+export async function parseWitnessKey(c: RegisterCrypto, vkey: string): Promise<VerifierKey> {
+  const a = vkey.indexOf("+");
+  const b = vkey.indexOf("+", a + 1);
+  if (a < 1 || b < 0) throw new Error("ungueltiger Zeugen-Schluessel");
+  const name = vkey.slice(0, a);
+  const hash = vkey.slice(a + 1, b);
+  const raw = fromBase64(vkey.slice(b + 1));
+  if (!/^[0-9a-f]{8}$/.test(hash) || raw.length !== 33 || raw[0] !== ALG_COSIGNATURE_V1) throw new Error("ungueltiger Zeugen-Schluessel");
+  const publicKey = raw.slice(1);
+  if (toHex(await witnessKeyHash(c, name, publicKey)) !== hash) throw new Error("Schluessel-Hash passt nicht");
+  return { name, keyHash: fromHex(hash), publicKey };
+}
+
+/** Was der Zeuge unterschreibt: "cosignature/v1", seine Uhrzeit, dann der Checkpoint-Text. */
+export function cosignatureMessage(text: string, time: number): Uint8Array {
+  if (!Number.isSafeInteger(time) || time < 0) throw new Error("ungueltige Zeit");
+  return enc.encode(`cosignature/v1\ntime ${time}\n${text}`);
+}
+
+/** Signaturzeile des Zeugen: Schluessel-Hash, Zeit als u64, Ed25519-Signatur. */
+export function cosignature(key: { name: string; keyHash: Uint8Array }, time: number, signature: Uint8Array): NoteSignature {
+  if (signature.length !== 64) throw new Error("Signatur muss 64 Byte haben");
+  return { name: key.name, keyHash: key.keyHash, signature: concatBytes(u64(time), signature) };
+}
+
+/** Hat dieser Zeuge die Notiz gegengezeichnet? Gibt Text und Zeit zurueck, sonst null. */
+export async function verifyCosignature(note: string, key: VerifierKey, verify: Ed25519Verify): Promise<{ text: string; time: number } | null> {
+  const { text, signatures } = parseSignedNote(note);
+  for (const s of signatures) {
+    if (s.name !== key.name || !bytesEqual(s.keyHash, key.keyHash) || s.signature.length !== 72) continue;
+    const t = s.signature.slice(0, 8);
+    let time = 0;
+    for (const b of t) time = time * 256 + b;
+    if (!Number.isSafeInteger(time)) continue;
+    if (await verify(key.publicKey, s.signature.slice(8), cosignatureMessage(text, time))) return { text, time };
+  }
+  return null;
+}
+
+/** Notiz mit einer weiteren Signaturzeile (Zeuge haengt sich an). */
+export function addSignature(note: string, sig: NoteSignature): string {
+  const { text, signatures } = parseSignedNote(note);
+  return formatSignedNote(text, [...signatures.filter((s) => !(s.name === sig.name && bytesEqual(s.keyHash, sig.keyHash))), sig]);
+}
+
+/**
+ * Setzt der aktuelle Stand (Groesse n, Wurzel, Kacheln h) einen frueheren fort?
+ * Der fruehere muss von Passly unterschrieben sein. Wirft mit lesbarer Meldung,
+ * wenn das Register geschrumpft ist oder die Vergangenheit umgeschrieben wurde.
+ */
+export async function checkContinues(
+  c: RegisterCrypto,
+  verify: Ed25519Verify,
+  key: VerifierKey,
+  current: { size: number; root: Uint8Array },
+  h: RangeHash,
+  earlierNote: string,
+): Promise<Checkpoint> {
+  const text = await verifySignedNote(earlierNote, key, verify);
+  if (!text) throw new Error("Der frühere Stand ist nicht gültig von Passly unterschrieben.");
+  const prev = parseCheckpoint(text);
+  if (prev.origin !== key.name) throw new Error("Der frühere Stand gehört zu einem anderen Register.");
+  if (prev.size > current.size) throw new Error(`Das Register ist geschrumpft: vorher ${prev.size}, jetzt ${current.size} Einträge.`);
+  if (prev.size === current.size) {
+    if (!bytesEqual(prev.root, current.root)) throw new Error(`Gleiche Größe ${current.size}, aber andere Wurzel: die Vergangenheit wurde umgeschrieben.`);
+  } else if (prev.size > 0) {
+    const proof = await consistencyProofFrom(prev.size, current.size, h);
+    if (!(await verifyConsistency(c, { m: prev.size, n: current.size, rootM: prev.root, rootN: current.root, proof }))) {
+      throw new Error(`Der neue Stand (${current.size}) setzt den vorigen (${prev.size}) nicht fort: die Vergangenheit wurde umgeschrieben.`);
+    }
+  }
+  return prev;
+}
+
 // ---------------------------------------------------------------- Lebenszyklus
 
 export type TicketStatus = "valid" | "redeemed" | "revoked";
@@ -787,7 +884,19 @@ export interface TicketCheck {
   handedOn: boolean;
   /** Beweisweg des neuesten Eintrags, zum Zeichnen: Blatt-Hash und Geschwister bis zur Wurzel. */
   path: { index: number; leafHash: Uint8Array; proof: Uint8Array[] } | null;
+  /** Fruehere Staende, die dieser fortsetzt: vom Zeugen gegengezeichnet oder im Browser gemerkt. */
+  confirmed: Confirmation[];
 }
+
+export interface Confirmation {
+  source: "witness" | "memory";
+  size: number;
+  /** Nur beim Zeugen: wann er gegengezeichnet hat (Unix-Sekunden). */
+  time: number | null;
+}
+
+/** Ein frueherer Stand zum Vergleich; mit `witness` muss er von diesem Zeugen gegengezeichnet sein. */
+export interface EarlierCheckpoint { note: string; witness?: VerifierKey }
 
 export interface TicketGeneration {
   view: Uint8Array;
@@ -812,7 +921,7 @@ export async function checkTicket(
   key: VerifierKey,
   files: RegisterFiles,
   generations: TicketGeneration[],
-  opts: { wallet?: string; pass?: boolean } = {},
+  opts: { wallet?: string; pass?: boolean; earlier?: EarlierCheckpoint[] } = {},
 ): Promise<TicketCheck> {
   const text = await verifySignedNote(new TextDecoder().decode(await files("checkpoint")), key, verify);
   if (!text) throw new Error("Die Unterschrift des Registers stimmt nicht.");
@@ -821,6 +930,20 @@ export async function checkTicket(
   const size = checkpoint.size;
   const h = tileRangeHash(c, size, (ref) => files(tilePath(ref)));
   if (size > 0 && !bytesEqual(await h(0, size), checkpoint.root)) throw new Error("Die Dateien passen nicht zum unterschriebenen Stand.");
+
+  // Gedaechtnis, das nicht von diesem Stand abhaengt: ohne es glaubt der Browser
+  // jeder in sich stimmigen Geschichte, auch einer umgeschriebenen (Manipulationstest Teil B).
+  const confirmed: Confirmation[] = [];
+  for (const e of opts.earlier ?? []) {
+    let time: number | null = null;
+    if (e.witness) {
+      const cs = await verifyCosignature(e.note, e.witness, verify);
+      if (!cs) throw new Error("Die Bestätigung des Zeugen ist nicht echt.");
+      time = cs.time;
+    }
+    const prev = await checkContinues(c, verify, key, checkpoint, h, e.note);
+    confirmed.push({ source: e.witness ? "witness" : "memory", size: prev.size, time });
+  }
 
   const bundles = new Map<number, Promise<Uint8Array[]>>();
   const leafAt = async (i: number) => {
@@ -864,7 +987,7 @@ export async function checkTicket(
   const lifecycle = replayLifecycle(sorted.map((e) => ({ index: e.index, kind: e.kind, occasion: opts.pass && e.kind === "redeem" ? `#${e.index}` : undefined })), { pass: opts.pass });
   const last = sorted.at(-1);
   const path = last ? { index: last.index, leafHash: last.leafHash, proof: await inclusionProofFrom(last.index, size, h) } : null;
-  return { checkpoint, entries: sorted.map(({ index, kind, role, date, holderIsYou }) => ({ index, kind, role, date, holderIsYou })), lifecycle, pending, handedOn, path };
+  return { checkpoint, entries: sorted.map(({ index, kind, role, date, holderIsYou }) => ({ index, kind, role, date, holderIsYou })), lifecycle, pending, handedOn, path, confirmed };
 }
 
 // ---------------------------------------------------------------- Ganzes Register lesen (Nachzaehlen, Waechter)
@@ -988,19 +1111,7 @@ export async function watchRegister(
 
   let previous = 0;
   if (opts.previousNote) {
-    const prevText = await verifySignedNote(opts.previousNote, key, verify);
-    if (!prevText) throw new Error("Der gespeicherte vorige Stand ist nicht gültig unterschrieben.");
-    const prev = parseCheckpoint(prevText);
-    previous = prev.size;
-    if (prev.size > size) throw new Error(`Das Register ist geschrumpft: vorher ${prev.size}, jetzt ${size} Einträge.`);
-    if (prev.size === size) {
-      if (!bytesEqual(prev.root, checkpoint.root)) throw new Error(`Gleiche Größe ${size}, aber andere Wurzel: die Vergangenheit wurde umgeschrieben.`);
-    } else if (prev.size > 0) {
-      const proof = await consistencyProofFrom(prev.size, size, h);
-      if (!(await verifyConsistency(c, { m: prev.size, n: size, rootM: prev.root, rootN: checkpoint.root, proof }))) {
-        throw new Error(`Der neue Stand (${size}) setzt den vorigen (${prev.size}) nicht fort: die Vergangenheit wurde umgeschrieben.`);
-      }
-    }
+    previous = (await checkContinues(c, verify, key, checkpoint, h, opts.previousNote)).size;
   }
 
   const kinds: Record<EntryKind, number> = { issue: 0, transfer: 0, redeem: 0, revoke: 0, reinstate: 0 };

@@ -11,6 +11,14 @@
  *       fortsetzt (Konsistenzbeweis); mit --voll zusätzlich jeden Eintrag.
  *       --schreibe legt den geprüften Stand ab (für den nächsten Lauf).
  *
+ *   node pruefen.mjs zeuge-schluessel --name <name> --geheim <datei>
+ *       Neuer Zeugen-Schlüssel: das Geheimnis (32 Byte, Base64) landet nur in
+ *       der Datei (Rechte 600), der öffentliche Schlüssel auf der Konsole.
+ *
+ *   ZEUGE_SCHLUESSEL=<base64> node pruefen.mjs bezeugen --stand <checkpoint-datei> --name <name> --schreibe <datei>
+ *       Zeichnet einen schon GEPRÜFTEN Stand als Zeuge gegen (C2SP
+ *       tlog-cosignature/v1). Der Wächter ruft das erst nach `stand` auf.
+ *
  *   node pruefen.mjs nachzaehlen --datei <nachzaehlen-….json>
  *       Die Datei für den Kassenprüfer aus dem Dashboard: zählt das Event zum
  *       darin unterschriebenen Stand nach und prüft, dass der heutige Stand ihn
@@ -19,7 +27,7 @@
  * Exit-Codes: 0 alles stimmt · 1 Bruch (Manipulation oder Fehler im Register)
  *             · 2 Aufruf falsch oder Register nicht erreichbar.
  */
-import { createHash, createHmac, createPublicKey, verify as edVerify } from 'node:crypto';
+import { createHash, createHmac, createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -113,10 +121,39 @@ async function nachzaehlen() {
   if (abweichung.length) process.exitCode = 1;
 }
 
-const befehle = { stand, nachzaehlen };
+const PKCS8_ED25519 = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+async function zeugeSchluessel() {
+  if (!args.name || !args.geheim) throw Object.assign(new Error('zeuge-schluessel braucht --name und --geheim'), { code: 2 });
+  if (fs.existsSync(args.geheim)) throw Object.assign(new Error(`${args.geheim} gibt es schon, nicht überschrieben`), { code: 2 });
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const seed = privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32);
+  fs.writeFileSync(args.geheim, seed.toString('base64') + '\n', { mode: 0o600 });
+  console.log(await R.formatWitnessKey(c, args.name, new Uint8Array(publicKey.export({ format: 'der', type: 'spki' }).subarray(-32))));
+}
+
+async function bezeugen() {
+  const seedB64 = process.env.ZEUGE_SCHLUESSEL;
+  if (!args.stand || !args.name || !args.schreibe || !seedB64) throw Object.assign(new Error('bezeugen braucht --stand, --name, --schreibe und ZEUGE_SCHLUESSEL'), { code: 2 });
+  const seed = Buffer.from(seedB64.trim(), 'base64');
+  if (seed.length !== 32) throw Object.assign(new Error('ZEUGE_SCHLUESSEL muss 32 Byte (Base64) sein'), { code: 2 });
+  const priv = createPrivateKey({ key: Buffer.concat([PKCS8_ED25519, seed]), format: 'der', type: 'pkcs8' });
+  const pub = new Uint8Array(createPublicKey(priv).export({ format: 'der', type: 'spki' }).subarray(-32));
+  const key = await R.parseWitnessKey(c, await R.formatWitnessKey(c, args.name, pub));
+  const note = fs.readFileSync(args.stand, 'utf8');
+  const { text } = R.parseSignedNote(note);
+  const time = Math.floor(Date.now() / 1000);
+  const sig = new Uint8Array(edSign(null, R.cosignatureMessage(text, time), priv));
+  const out = R.addSignature(note, R.cosignature(key, time, sig));
+  if (!(await R.verifyCosignature(out, key, ed))) throw new Error('eigene Gegenzeichnung lässt sich nicht prüfen');
+  fs.writeFileSync(args.schreibe, out);
+  ausgabe({ bezeugt: R.parseCheckpoint(text).size, zeit: new Date(time * 1000).toISOString(), zeuge: await R.formatWitnessKey(c, args.name, pub) });
+}
+
+const befehle = { stand, nachzaehlen, bezeugen, 'zeuge-schluessel': zeugeSchluessel };
 const befehl = befehle[args._[0]];
 if (!befehl) {
-  console.error('Aufruf: pruefen.mjs stand --base <url> --vkey <schluessel|datei> [--vorher <datei>] [--voll] [--schreibe <datei>]\n        pruefen.mjs nachzaehlen --datei <nachzaehlen-….json>');
+  console.error('Aufruf: pruefen.mjs stand --base <url> --vkey <schluessel|datei> [--vorher <datei>] [--voll] [--schreibe <datei>]\n        pruefen.mjs nachzaehlen --datei <nachzaehlen-….json>\n        pruefen.mjs zeuge-schluessel --name <name> --geheim <datei>\n        ZEUGE_SCHLUESSEL=… pruefen.mjs bezeugen --stand <datei> --name <name> --schreibe <datei>');
   process.exit(2);
 }
 try {
